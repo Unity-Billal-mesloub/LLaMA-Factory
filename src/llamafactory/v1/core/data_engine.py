@@ -14,26 +14,33 @@
 
 """The definition of data engine.
 
-Init Data engine:
+How to use:
+data_engine = DataEngine(data_args.train_dataset)
+data_engine[i]: Get the sample via index.
+
+Init workflow:
 1. Parse dataset info from arguments.
 2. Load datasets according to dataset info.
 3. Build data index (and reweight samples if necessary).
 
-Get Data Sample:
+Get data sample:
 1. Get sample from data index.
 2. Convert sample to standard format.
 3. Return sample.
+
+Note:
+1. The data engine is equivalent to the torch dataset.
+2. The data engine is agnostic to the model used.
 """
 
 import os
 from collections.abc import Iterable
-from typing import Any, Union
+from typing import Any
 
 from huggingface_hub import hf_hub_download
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 
-from ..config.data_args import DataArguments
 from ..utils.types import DatasetInfo, HFDataset, Sample
 
 
@@ -44,9 +51,9 @@ class DataEngine(Dataset):
         data_args: Data arguments.
     """
 
-    def __init__(self, data_args: DataArguments) -> None:
-        self.args = data_args
-        """Data arguments."""
+    def __init__(self, dataset_path: str) -> None:
+        self.path = dataset_path
+        """Dataset path."""
         self.datasets: dict[str, HFDataset] = {}
         """Dict of (dataset_name, dataset)"""
         self.dataset_infos: dict[str, DatasetInfo] = {}
@@ -61,27 +68,30 @@ class DataEngine(Dataset):
 
     def _get_dataset_info(self) -> None:
         """Get dataset info from data arguments."""
-        if self.args.dataset.endswith(".yaml") and os.path.isfile(self.args.dataset):  # local file
-            self.dataset_infos = OmegaConf.load(self.args.dataset)
-        elif self.args.dataset.endswith(".yaml"):  # hf hub uri, e.g. llamafactory/v1-sft-demo/dataset_info.yaml
-            repo_id, filename = os.path.split(self.args.dataset)
+        if self.path.endswith(".yaml") and os.path.isfile(self.path):  # local file
+            self.dataset_infos = OmegaConf.load(self.path)
+        elif self.path.endswith(".yaml"):  # hf hub uri, e.g. llamafactory/v1-sft-demo/dataset_info.yaml
+            repo_id, filename = os.path.split(self.path)
             filepath = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset")
             self.dataset_infos = OmegaConf.load(filepath)
-        elif os.path.exists(self.args.dataset):  # local file(s)
-            self.dataset_infos = {"default": {"path": self.args.dataset, "source": "local"}}
+        elif os.path.exists(self.path):  # local file(s)
+            self.dataset_infos = {"default": {"path": self.path, "source": "local"}}
         else:  # hf hub dataset, e.g. llamafactory/v1-sft-demo
-            self.dataset_infos = {"default": {"path": self.args.dataset}}
+            self.dataset_infos = {"default": {"path": self.path}}
 
     def _load_dataset(self) -> None:
         """Load datasets according to dataset info."""
+        is_streaming = [dataset_info.get("streaming", False) for dataset_info in self.dataset_infos.values()]
+        self.streaming = any(is_streaming)
+        if all(is_streaming) != any(is_streaming):
+            raise ValueError("All datasets must be streaming or non-streaming.")
+
         for dataset_name, dataset_info in self.dataset_infos.items():
             split = dataset_info.get("split", "train")
-            streaming = dataset_info.get("streaming", False)
-            self.streaming |= streaming
             if dataset_info.get("source", "hf_hub") == "hf_hub":
                 from datasets import load_dataset
 
-                self.datasets[dataset_name] = load_dataset(dataset_info["path"], split=split, streaming=streaming)
+                self.datasets[dataset_name] = load_dataset(dataset_info["path"], split=split, streaming=self.streaming)
             else:  # data loader plugin
                 from ..plugins.data_plugins.loader import DataLoaderPlugin
 
@@ -90,18 +100,17 @@ class DataEngine(Dataset):
     def _build_data_index(self) -> None:
         """Build dataset index."""
         for dataset_name, dataset in self.datasets.items():
-            streaming = self.dataset_infos[dataset_name].get("streaming", False)
-            if streaming:
+            if self.streaming:
                 data_index = [(dataset_name, -1) for _ in range(1000)]
             else:
                 data_index = [(dataset_name, sample_index) for sample_index in range(len(dataset))]
 
             size = self.dataset_infos[dataset_name].get("size")
             weight = self.dataset_infos[dataset_name].get("weight")
-            if size or weight:  # data index plugin
-                from ..plugins.data_plugins.loader import DataIndexPlugin
+            if size or weight:
+                from ..plugins.data_plugins.loader import adjust_data_index
 
-                data_index = DataIndexPlugin().adjust_data_index(data_index, size, weight)
+                data_index = adjust_data_index(data_index, size, weight)
 
             self.data_index.extend(data_index)
 
@@ -134,7 +143,7 @@ class DataEngine(Dataset):
         else:
             return len(self.data_index)
 
-    def __getitem__(self, index: Union[int, Any]) -> Union[Sample, list[Sample]]:
+    def __getitem__(self, index: int | Any) -> Sample | list[Sample]:
         """Get dataset item.
 
         Args:
@@ -150,9 +159,9 @@ class DataEngine(Dataset):
             dataset_name, sample_index = self.data_index[index]
             return self._convert_data_sample(self.datasets[dataset_name][sample_index], dataset_name)
         else:  # data selector plugin
-            from ..plugins.data_plugins.loader import DataSelectorPlugin
+            from ..plugins.data_plugins.loader import select_data_sample
 
-            selected_index = DataSelectorPlugin().select(self.data_index, index)
+            selected_index = select_data_sample(self.data_index, index)
             if isinstance(selected_index, list):
                 return [
                     self._convert_data_sample(self.datasets[dataset_name][sample_index], dataset_name)
@@ -177,11 +186,11 @@ class DataEngine(Dataset):
 
 if __name__ == "__main__":
     """
-    python -m llamafactory.v1.core.data_engine --model none --dataset data/v1_sft_demo.yaml
-    python -m llamafactory.v1.core.data_engine --model none --dataset data/v1_dpo_demo.yaml
+    python -m llamafactory.v1.core.data_engine --train_dataset data/v1_sft_demo.yaml
+    python -m llamafactory.v1.core.data_engine --train_dataset data/v1_dpo_demo.yaml
     """
     from ..config.arg_parser import get_args
 
-    data_args, *_ = get_args()
-    data_engine = DataEngine(data_args=data_args)
+    _, data_args, *_ = get_args()
+    data_engine = DataEngine(data_args.train_dataset)
     print(data_engine[0])

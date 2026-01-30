@@ -15,10 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 import transformers
@@ -65,25 +66,25 @@ else:
     _TRAIN_MCA_CLS = tuple()
 
 
-def read_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> Union[dict[str, Any], list[str]]:
+def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] | list[str]:
     r"""Get arguments from the command line or a config file."""
     if args is not None:
         return args
 
-    if sys.argv[1].endswith(".yaml") or sys.argv[1].endswith(".yml"):
+    if len(sys.argv) > 1 and (sys.argv[1].endswith(".yaml") or sys.argv[1].endswith(".yml")):
         override_config = OmegaConf.from_cli(sys.argv[2:])
         dict_config = OmegaConf.load(Path(sys.argv[1]).absolute())
         return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
-    elif sys.argv[1].endswith(".json"):
+    elif len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
         override_config = OmegaConf.from_cli(sys.argv[2:])
-        dict_config = OmegaConf.load(Path(sys.argv[1]).absolute())
+        dict_config = OmegaConf.create(json.load(Path(sys.argv[1]).absolute()))
         return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
     else:
         return sys.argv[1:]
 
 
 def _parse_args(
-    parser: "HfArgumentParser", args: Optional[Union[dict[str, Any], list[str]]] = None, allow_extra_keys: bool = False
+    parser: "HfArgumentParser", args: dict[str, Any] | list[str] | None = None, allow_extra_keys: bool = False
 ) -> tuple[Any]:
     args = read_args(args)
     if isinstance(args, dict):
@@ -142,14 +143,6 @@ def _verify_model_args(
         logger.warning_rank0("We should use slow tokenizer for the Yi models. Change `use_fast_tokenizer` to False.")
         model_args.use_fast_tokenizer = False
 
-    # Validate advanced training features
-    if model_args.fp8 and model_args.quantization_bit is not None:
-        raise ValueError("FP8 training is not compatible with quantization. Please disable one of them.")
-
-    if model_args.fp8_enable_fsdp_float8_all_gather and not model_args.fp8:
-        logger.warning_rank0("fp8_enable_fsdp_float8_all_gather requires fp8=True. Setting fp8=True.")
-        model_args.fp8 = True
-
 
 def _check_extra_dependencies(
     model_args: "ModelArguments",
@@ -205,13 +198,13 @@ def _check_extra_dependencies(
             check_version("rouge_chinese", mandatory=True)
 
 
-def _parse_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _TRAIN_CLS:
+def _parse_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
     parser = HfArgumentParser(_TRAIN_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
     return _parse_args(parser, args, allow_extra_keys=allow_extra_keys)
 
 
-def _parse_train_mca_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _TRAIN_MCA_CLS:
+def _parse_train_mca_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_MCA_CLS:
     parser = HfArgumentParser(_TRAIN_MCA_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
     model_args, data_args, training_args, finetuning_args, generating_args = _parse_args(
@@ -232,25 +225,25 @@ def _configure_mca_training_args(training_args, data_args, finetuning_args) -> N
     finetuning_args.use_mca = True
 
 
-def _parse_infer_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _INFER_CLS:
+def _parse_infer_args(args: dict[str, Any] | list[str] | None = None) -> _INFER_CLS:
     parser = HfArgumentParser(_INFER_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
     return _parse_args(parser, args, allow_extra_keys=allow_extra_keys)
 
 
-def _parse_eval_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _EVAL_CLS:
+def _parse_eval_args(args: dict[str, Any] | list[str] | None = None) -> _EVAL_CLS:
     parser = HfArgumentParser(_EVAL_ARGS)
     allow_extra_keys = is_env_enabled("ALLOW_EXTRA_ARGS")
     return _parse_args(parser, args, allow_extra_keys=allow_extra_keys)
 
 
-def get_ray_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> RayArguments:
+def get_ray_args(args: dict[str, Any] | list[str] | None = None) -> RayArguments:
     parser = HfArgumentParser(RayArguments)
     (ray_args,) = _parse_args(parser, args, allow_extra_keys=True)
     return ray_args
 
 
-def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _TRAIN_CLS:
+def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
     if is_env_enabled("USE_MCA"):
         model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(args)
     else:
@@ -347,6 +340,9 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     if training_args.deepspeed is not None and (finetuning_args.use_galore or finetuning_args.use_apollo):
         raise ValueError("GaLore and APOLLO are incompatible with DeepSpeed yet.")
 
+    if not finetuning_args.use_mca and training_args.fp8 and model_args.quantization_bit is not None:
+        raise ValueError("FP8 training is not compatible with quantization. Please disable one of them.")
+
     if model_args.infer_backend != EngineName.HF:
         raise ValueError("vLLM/SGLang backend is only available for API, CLI and Web.")
 
@@ -362,6 +358,10 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     _set_env_vars()
     _verify_model_args(model_args, data_args, finetuning_args)
     _check_extra_dependencies(model_args, finetuning_args, training_args)
+
+    if not finetuning_args.use_mca and training_args.fp8_enable_fsdp_float8_all_gather and not training_args.fp8:
+        logger.warning_rank0("fp8_enable_fsdp_float8_all_gather requires fp8=True. Setting fp8=True.")
+        model_args.fp8 = True
 
     if (
         training_args.do_train
@@ -473,7 +473,7 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     return model_args, data_args, training_args, finetuning_args, generating_args
 
 
-def get_infer_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _INFER_CLS:
+def get_infer_args(args: dict[str, Any] | list[str] | None = None) -> _INFER_CLS:
     model_args, data_args, finetuning_args, generating_args = _parse_infer_args(args)
 
     # Setup logging
@@ -508,7 +508,7 @@ def get_infer_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
     return model_args, data_args, finetuning_args, generating_args
 
 
-def get_eval_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _EVAL_CLS:
+def get_eval_args(args: dict[str, Any] | list[str] | None = None) -> _EVAL_CLS:
     model_args, data_args, eval_args, finetuning_args = _parse_eval_args(args)
 
     # Setup logging

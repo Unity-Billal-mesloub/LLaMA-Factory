@@ -138,17 +138,24 @@ def patch_config(
     if getattr(config, "model_type", None) == "kimi_vl" and is_trainable:
         setattr(config.text_config, "topk_method", "greedy")
 
-    if "InternVLChatModel" in getattr(config, "architectures", []):
+    architectures = getattr(config, "architectures", None)
+    if isinstance(architectures, list) and "InternVLChatModel" in architectures:
         raise ValueError(
             "Please download the internvl models in a Hugging Face–compatible format "
             "(for example, https://huggingface.co/OpenGVLab/InternVL3-8B-hf)."
         )
 
-    if "LlavaLlamaForCausalLM" in getattr(config, "architectures", []):
+    if isinstance(architectures, list) and "LlavaLlamaForCausalLM" in architectures:
         raise ValueError("Please download llava models with hf-compatible format: https://huggingface.co/llava-hf")
 
     if getattr(config, "model_type", None) == "internlm3" and not is_transformers_version_greater_than("4.47.1"):
         raise RuntimeError("InternLM3 model requires transformers>=4.47.1, please upgrade it.")
+
+    if getattr(config, "model_type", None) == "lfm2_vl" and not is_transformers_version_greater_than("4.58.0"):
+        raise RuntimeError(
+            "LFM2.5-VL model requires transformers>=4.58.0 or install from commit: "
+            "pip install git+https://github.com/huggingface/transformers.git@3c2517727ce28a30f5044e01663ee204deb1cdbe"
+        )
 
     if getattr(config, "model_type", None) == "qwen3_omni_moe":
         patch_qwen3_omni_moe_thinker_text_sparse_moe_block()
@@ -156,16 +163,13 @@ def patch_config(
     # deepspeed zero3 is not compatible with low_cpu_mem_usage
     init_kwargs["low_cpu_mem_usage"] = model_args.low_cpu_mem_usage and (not is_deepspeed_zero3_enabled())
 
-    # do not cast data type of the model deepspeed zero3 without qlora
-    if not (is_deepspeed_zero3_enabled() and model_args.quantization_bit is None):
-        init_kwargs["torch_dtype"] = model_args.compute_dtype
+    # fsdp/deepspeed zero3 does not need device map
+    if not (is_deepspeed_zero3_enabled() or is_fsdp_enabled()) and init_kwargs["low_cpu_mem_usage"]:
+        if "device_map" not in init_kwargs and model_args.device_map:
+            init_kwargs["device_map"] = model_args.device_map  # device map requires low_cpu_mem_usage=True
 
-        if init_kwargs["low_cpu_mem_usage"] and not is_fsdp_enabled():  # fsdp does not need device map
-            if "device_map" not in init_kwargs and model_args.device_map:
-                init_kwargs["device_map"] = model_args.device_map  # device map requires low_cpu_mem_usage=True
-
-            if init_kwargs.get("device_map", None) == "auto":
-                init_kwargs["offload_folder"] = model_args.offload_folder
+        if init_kwargs.get("device_map", None) == "auto":
+            init_kwargs["offload_folder"] = model_args.offload_folder
 
 
 def patch_model(
